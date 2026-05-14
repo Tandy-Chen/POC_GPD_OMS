@@ -74,7 +74,7 @@ def compute_performance(rows: list[ContractRow]) -> PerformanceResult:
     carbon_upload_count = eligible_a3_count if A3_ASSUME_IN_REPORT_IS_COMPLIANT else carbon_upload_count_old
 
     global_vendor_set: set[str] = set()
-    for row in rows:
+    for row in signed_over_30m:
         if normalize_compact_text(row.kpi_key) != KPI_BASE_KEY:
             continue
         vendor_key = normalize_vendor_key(row.vendor_name_raw)
@@ -83,7 +83,7 @@ def compute_performance(rows: list[ContractRow]) -> PerformanceResult:
     unique_vendor_total = len(global_vendor_set)
 
     net_zero_not_signed_vendor_set: set[str] = set()
-    for row in rows:
+    for row in signed_over_30m:
         if normalize_compact_text(row.kpi_key) != KPI_BASE_KEY:
             continue
         if "未簽" not in normalize_compact_text(row.net_zero_commitment_raw):
