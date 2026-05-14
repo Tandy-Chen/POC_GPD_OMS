@@ -3,3 +3,12 @@
 *.pyc
 .venv/
 
+# Data files (keep directory structure only)
+scope3_ghg/inputs/*.xlsx
+scope3_ghg/inputs/*.xls
+scope3_ghg/outputs/*.xlsx
+scope3_ghg/outputs/*.xls
+!scope3_ghg/inputs/.gitkeep
+!scope3_ghg/inputs/README.md
+!scope3_ghg/outputs/.gitkeep
+

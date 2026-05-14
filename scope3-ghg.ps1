@@ -3,9 +3,17 @@ param(
     [string]$Command = 'process',
     [string]$SourcePath,
     [string]$Sheet = 'sheet1',
-    [string]$InputDir = (Join-Path $PSScriptRoot 'inputs'),
-    [string]$OutputDir = (Join-Path $PSScriptRoot 'outputs')
+    [string]$InputDir,
+    [string]$OutputDir
 )
+
+$projectDir = Join-Path $PSScriptRoot 'scope3_ghg'
+if (-not $InputDir) {
+    $InputDir = Join-Path $projectDir 'inputs'
+}
+if (-not $OutputDir) {
+    $OutputDir = Join-Path $projectDir 'outputs'
+}
 
 $launcher = Join-Path $PSScriptRoot 'scope3-ghg.cmd'
 $argsList = @()
