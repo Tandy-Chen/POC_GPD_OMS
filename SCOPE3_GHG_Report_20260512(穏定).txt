@@ -1,0 +1,904 @@
+/**
+ * SCOPE3_GHG_Report_GE115 — 正式版 v2.7.0 (Final)
+ *
+ * 產出：
+ * - 統計分析_矩陣
+ * - 稽核異常清單
+ * - 碳盤查績效統計（含各部門分表）
+ *
+ * v2.7.0 修訂摘要（最終精修）：
+ * ✅ 本次修正：
+ *  1) 新增「未落入部門統計金額」一列，使其與件數對應，提升報表完整性。
+ *  2) 將兩個「檢核」區塊的間距由 3 行縮減為 1 行，版面更精實。
+ *
+ * (v2.6.0: 修正檢核區的欄位對齊與金額加總錯誤)
+ * (v2.5.0: 修正檢核邏輯，承認「未分類」為正常數據)
+ */
+
+/* =========================
+ 0) 治理識別（命名統一）
+========================= */
+const SCRIPT_ID: string = "SCOPE3_GHG_Report_GE115";
+const SCRIPT_VERSION: string = "v2.7.0";
+
+/* =========================
+ 1) 報表輸出設定（人類可讀命名）
+========================= */
+const SHEET_SOURCE: string = "sheet1";
+
+const ENABLE_TABLE_STYLE_OUTLINE: boolean = true;
+/** 主要報表（固定三張） */
+const REPORT_MAIN_SHEET_NAMES: string[] = ["統計分析_矩陣", "稽核異常清單", "碳盤查績效統計"];
+/** 碳盤查績效分表前綴：碳盤查績效統計_政府處... */
+const PERFORMANCE_SHEET_PREFIX: string = "碳盤查績效統計_";
+/** Excel Table 樣式（用於外框一致化） */
+const REPORT_TABLE_STYLE_NAME: string = "TableStyleMedium2";
+const TABLE_HAS_HEADER_ROW: boolean = true;
+const TABLE_SHOW_FILTER_BUTTON: boolean = false;
+const ENABLE_AUTOFIT_COLUMNS: boolean = true;
+const MIN_COL_WIDTH: number = 12;
+/** 表頭字色（深藍） */
+const HEADER_TEXT_COLOR: string = "#003399";
+/** 是否在矩陣表附上備註段落 */
+const SHOW_MATRIX_NOTE_ROW: boolean = true;
+/** 換行控制（影響列高） */
+const PERFORMANCE_LABEL_WRAP: boolean = false;
+const MATRIX_NOTE_WRAP: boolean = true;
+const EXECUTION_TIME_WRAP: boolean = false;
+/** 碳盤查績效統計（A/B/C 欄）欄寬保護（避免欄名截斷） */
+const PERF_COL_WIDTH_A: number = 34;
+const PERF_COL_WIDTH_B: number = 14;
+const PERF_COL_WIDTH_C: number = 16;
+/** 台北時間固定偏移（UTC+8） */
+const TAIPEI_UTC_OFFSET_HOURS: number = 8;
+
+/* =========================
+ 2) KPI 治理開關（A3 口徑顯式化）
+========================= */
+/**
+ * A3（碳足跡條款落實達成率）治理口徑：
+ * - true ：「入報表即合規」→ A3 固定 100%
+ * - false：回復舊口徑（以 KPI=盤查範圍契約 等條件計算）
+ */
+const A3_ASSUME_IN_REPORT_IS_COMPLIANT: boolean = true;
+
+/**
+ * ✅ KPI連動治理：本版把「狀態7類 + 檢核」掛 KPI 母體
+ * KPI 母體鍵（目前制度：盤查範圍契約）
+ */
+const KPI_BASE_KEY: string = "盤查範圍契約";
+
+/* =========================
+ 3) 型別宣告（嚴格型別、無 any）
+========================= */
+type ContractRow = {
+  contractId: string; // 契約編號
+  contractName: string; // 契約名稱
+  contractAmount: number; // 契約金額
+  requesterUnit: string; // 請購人單位
+  requesterName: string; // 請購人
+  contractStatusRaw: string; // 契約狀態（原文）
+  kpiKey: string; // KPI（正規化後）
+  vendorNameRaw: string; // [統編]供應商名稱（原文）
+  netZeroCommitmentRaw: string; // 供應商是否簽署淨零承諾
+  iso14064EvidenceRaw: string; // ISO 14064 相關欄（來源可能不同欄名）
+};
+
+type DeptAggResult = {
+  deptCounts: number[]; // 依 DEPT_ORDER 順序
+  totalCount: number; // 依 filter 後全集（含未分類）
+  totalAmountM: number; // 百萬元（依 filter 後全集）
+};
+
+type MatrixRow = (string | number)[];
+type TwoD = (string | number | boolean | null)[][];
+
+/* =========================
+ 4) 部門/狀態/列定義（制度常數）
+========================= */
+const DEPT_KEYWORDS: Record<string, string[]> = {
+  "政府處": ["政府應用處"],
+  "智聯處": ["智慧聯網處"],
+  "雲端處": ["雲端系統處"],
+  "系統處": ["營運系統管理處"],
+  "營發處": ["營運系統發展處"],
+  "中資處": ["中部資訊應用處"],
+  "商應處": ["商務應用處"],
+  "企應處": ["企業應用發展處"],
+  "行政處": ["行政管理處"]
+};
+const DEPT_ORDER: string[] = ["政府處", "智聯處", "雲端處", "系統處", "營發處", "中資處", "商應處", "企應處", "行政處"];
+
+const CONTRACT_STATUS_7: string[] = [
+  "等待供應商上傳第一筆資料",
+  "供應商已上傳資料，等待顧問審核",
+  "供應商已上傳增補資料，等待顧問審核",
+  "顧問表示有待解決事項，等待供應商上傳",
+  "資料通過顧問審核標準",
+  "請/採購人員認為不適合進行(數位內容採購)",
+  "請/採購人員認為不適合進行"
+];
+
+const MATRIX_ROW_DEFINITIONS: string[] = [
+  "已簽3000萬元(含)以上列管契約案",
+  ...CONTRACT_STATUS_7,
+  "自主盤查契約",
+  "盤查範圍契約(持續盤查契約)",
+  "資分碳智雲上載契約案",
+  "不重複供應商數",
+  "未簽署淨零承諾契約案"
+];
+
+/* =========================
+ 5) 字串/表頭正規化工具（schema drift 防護）
+========================= */
+/** 全形空白、零寬空白等 */
+const INVISIBLE_SPACE_RE: RegExp = /[\u00A0\u1680\u2000-\u200B\u202F\u205F\u3000]/g;
+
+function normalizeCompactText(s: string): string {
+  return (s ?? "").toString().replace(INVISIBLE_SPACE_RE, "").trim();
+}
+function normalizeVendorKey(s: string): string {
+  return (s ?? "").toString().replace(INVISIBLE_SPACE_RE, "").replace(/\s+/g, "").trim();
+}
+function toSafeNumber(v: unknown): number {
+  const x: number = Number(v);
+  return isFinite(x) ? x : 0;
+}
+function roundTo2(n: number): number {
+  return Math.round(n * 100) / 100;
+}
+function safeDivide(n: number, d: number): number {
+  if (!d || !isFinite(d) || d === 0) return 0;
+  return n / d;
+}
+/** 表頭正規化：去隱藏空白 + trim */
+function normalizeHeaderName(s: string): string {
+  return normalizeCompactText(String(s ?? ""));
+}
+
+/** 欄位 alias：來源檔欄位更名/新增時，用 alias 保持耐操 */
+const SOURCE_COLUMN_ALIASES: Record<string, string[]> = {
+  contractId: ["契約編號"],
+  contractName: ["契約名稱"],
+  contractAmount: ["契約金額"],
+  requesterUnit: ["請購人單位"],
+  requesterName: ["請購人"],
+  contractStatusRaw: ["契約狀態"],
+  kpiKey: ["KPI"],
+  vendorNameRaw: ["[統編]供應商名稱"],
+  netZeroCommitmentRaw: ["供應商是否簽署淨零承諾"],
+  iso14064EvidenceRaw: [
+    "ISO14064證書輔導實績",
+    "供應商是否取得 ISO 14064-1 有效查證聲明"
+  ]
+};
+
+/** 尋找必要欄位：找不到就 throw（含 alias 清單，利於維護） */
+function requireColumnIndex(normalizedHeaders: string[], fieldKey: string): number {
+  const aliasList: string[] = SOURCE_COLUMN_ALIASES[fieldKey] ?? [fieldKey];
+  for (const alias of aliasList) {
+    const idx: number = normalizedHeaders.indexOf(normalizeHeaderName(alias));
+    if (idx >= 0) return idx;
+  }
+  throw new Error(`(${SCRIPT_ID} ${SCRIPT_VERSION}) ${SHEET_SOURCE} 缺少必要欄位（${fieldKey}）：可接受欄名=${aliasList.join(" / ")}`);
+}
+
+/** 可選欄位：找不到回 -1 */
+function optionalColumnIndex(normalizedHeaders: string[], fieldKey: string): number {
+  const aliasList: string[] = SOURCE_COLUMN_ALIASES[fieldKey] ?? [fieldKey];
+  for (const alias of aliasList) {
+    const idx: number = normalizedHeaders.indexOf(normalizeHeaderName(alias));
+    if (idx >= 0) return idx;
+  }
+  return -1;
+}
+
+/* =========================
+ 6) 部門/狀態解析（制度映射）
+========================= */
+function resolveDeptKey(requesterUnit: string): string {
+  const unit: string = requesterUnit ?? "";
+  const hits: { dept: string; keyword: string }[] = [];
+  for (const dept of Object.keys(DEPT_KEYWORDS)) {
+    for (const k of DEPT_KEYWORDS[dept]) {
+      if (unit.indexOf(k) >= 0) hits.push({ dept, keyword: k });
+    }
+  }
+  if (hits.length > 0) {
+    hits.sort((a, b) => b.keyword.length - a.keyword.length);
+    return hits[0].dept;
+  }
+  // 後備：抓「分公司...處」
+  const m: RegExpMatchArray | null = unit.match(/分公司(.*?處)/);
+  if (m) {
+    const name: string = m[1];
+    for (const dept of Object.keys(DEPT_KEYWORDS)) {
+      for (const k of DEPT_KEYWORDS[dept]) {
+        if (name.indexOf(k.replace("處", "")) >= 0) return dept;
+      }
+    }
+  }
+  return "未分類";
+}
+
+function resolveStatusKey(statusText: string): string {
+  const s: string = statusText ?? "";
+  for (const t of CONTRACT_STATUS_7) {
+    if (s.indexOf(t) >= 0) return t;
+  }
+  return "其他";
+}
+
+/* =========================
+ 7) Sheet/Range 輔助
+========================= */
+function getOrCreateWorksheet(workbook: ExcelScript.Workbook, sheetName: string): ExcelScript.Worksheet {
+  const ws: ExcelScript.Worksheet | undefined = workbook.getWorksheet(sheetName);
+  if (ws) return ws;
+  return workbook.addWorksheet(sheetName);
+}
+
+function clearWorksheet(ws: ExcelScript.Worksheet): void {
+  const used: ExcelScript.Range | undefined = ws.getUsedRange();
+  if (used) used.clear(ExcelScript.ClearApplyTo.all);
+}
+
+function setHeaderRow(ws: ExcelScript.Worksheet, row1Based: number, headers: string[]): void {
+  const headerRange: ExcelScript.Range = ws.getRangeByIndexes(row1Based - 1, 0, 1, headers.length);
+  headerRange.setValues([headers] as TwoD);
+  const fmt: ExcelScript.RangeFormat = headerRange.getFormat();
+  fmt.getFill().setColor("#D9E1F2");
+  const font: ExcelScript.RangeFont = fmt.getFont();
+  font.setBold(true);
+  font.setColor(HEADER_TEXT_COLOR);
+  fmt.setHorizontalAlignment(ExcelScript.HorizontalAlignment.center);
+}
+
+function writeMatrix(ws: ExcelScript.Worksheet, startRow1: number, startCol1: number, data: (string | number)[][]): void {
+  if (!data || data.length === 0) return;
+  const rowCount: number = data.length;
+  const colCount: number = data[0].length;
+  const rng: ExcelScript.Range = ws.getRangeByIndexes(startRow1 - 1, startCol1 - 1, rowCount, colCount);
+  rng.setValues(data as TwoD);
+  rng.getColumn(0).getFormat().setHorizontalAlignment(ExcelScript.HorizontalAlignment.left);
+  for (let c = 1; c < colCount; c++) {
+    rng.getColumn(c).getFormat().setHorizontalAlignment(ExcelScript.HorizontalAlignment.right);
+  }
+}
+
+function autoFitUsedRange(ws: ExcelScript.Worksheet): void {
+  const used: ExcelScript.Range | undefined = ws.getUsedRange();
+  if (!used) return;
+  used.getFormat().autofitColumns();
+}
+
+function enforceMinColumnWidth(ws: ExcelScript.Worksheet, minWidth: number): void {
+  const used: ExcelScript.Range | undefined = ws.getUsedRange();
+  if (!used) return;
+  const cols: number = used.getColumnCount();
+  for (let c = 0; c < cols; c++) {
+    const colFmt: ExcelScript.RangeFormat = used.getColumn(c).getFormat();
+    const current: number = colFmt.getColumnWidth();
+    if (current < minWidth) colFmt.setColumnWidth(minWidth);
+  }
+}
+
+/** addTable 只接受 A1:D10，不接受 Sheet!A1:D10 */
+function normalizeRangeAddress(address: string): string {
+  const s: string = address ?? "";
+  return (s.indexOf("!") >= 0) ? s.split("!")[1] : s;
+}
+
+/* =========================
+ 8) 來源資料讀取（含 alias + 正規化）
+========================= */
+function readSourceRows(workbook: ExcelScript.Workbook): ContractRow[] {
+  const ws: ExcelScript.Worksheet | undefined = workbook.getWorksheet(SHEET_SOURCE);
+  if (!ws) throw new Error(`(${SCRIPT_ID} ${SCRIPT_VERSION}) 找不到工作表：${SHEET_SOURCE}`);
+  const used: ExcelScript.Range | undefined = ws.getUsedRange();
+  if (!used) throw new Error(`(${SCRIPT_ID} ${SCRIPT_VERSION}) ${SHEET_SOURCE} 無資料範圍`);
+
+  const values: TwoD = used.getValues();
+  if (!values || values.length < 2) return [];
+
+  const headerRow: (string | number | boolean | null)[] = values[0];
+  const normalizedHeaders: string[] = headerRow.map(v => normalizeHeaderName(String(v ?? "")));
+
+  const idxContractId: number = requireColumnIndex(normalizedHeaders, "contractId");
+  const idxContractName: number = requireColumnIndex(normalizedHeaders, "contractName");
+  const idxContractAmount: number = requireColumnIndex(normalizedHeaders, "contractAmount");
+  const idxRequesterUnit: number = requireColumnIndex(normalizedHeaders, "requesterUnit");
+  const idxRequesterName: number = requireColumnIndex(normalizedHeaders, "requesterName");
+  const idxContractStatus: number = requireColumnIndex(normalizedHeaders, "contractStatusRaw");
+  const idxKpi: number = requireColumnIndex(normalizedHeaders, "kpiKey");
+  const idxVendorName: number = requireColumnIndex(normalizedHeaders, "vendorNameRaw");
+  const idxNetZero: number = requireColumnIndex(normalizedHeaders, "netZeroCommitmentRaw");
+  const idxIso: number = optionalColumnIndex(normalizedHeaders, "iso14064EvidenceRaw");
+
+  const out: ContractRow[] = [];
+  for (let r = 1; r < values.length; r++) {
+    const row = values[r];
+    if (!row || row.length === 0) continue;
+    out.push({
+      contractId: String(row[idxContractId] ?? ""),
+      contractName: String(row[idxContractName] ?? ""),
+      contractAmount: toSafeNumber(row[idxContractAmount]),
+      requesterUnit: String(row[idxRequesterUnit] ?? ""),
+      requesterName: String(row[idxRequesterName] ?? ""),
+      contractStatusRaw: String(row[idxContractStatus] ?? ""),
+      kpiKey: normalizeCompactText(String(row[idxKpi] ?? "")), // ✅ KPI 正規化
+      vendorNameRaw: String(row[idxVendorName] ?? ""),
+      netZeroCommitmentRaw: String(row[idxNetZero] ?? ""),
+      iso14064EvidenceRaw: (idxIso >= 0 ? String(row[idxIso] ?? "") : "")
+    });
+  }
+  return out;
+}
+
+/* =========================
+ 9) 聚合（件數/金額）— 可維護口徑
+========================= */
+function aggregateByDept(
+  rows: ContractRow[],
+  predicate: (x: ContractRow) => boolean,
+  excludeUnsuitable: boolean
+): DeptAggResult {
+  const unsuitableSet: Set<string> = new Set<string>([
+    "請/採購人員認為不適合進行(數位內容採購)",
+    "請/採購人員認為不適合進行"
+  ]);
+
+  const filteredRows: ContractRow[] = rows.filter((r: ContractRow) => {
+    if (excludeUnsuitable && unsuitableSet.has(resolveStatusKey(r.contractStatusRaw))) return false;
+    return predicate(r);
+  });
+
+  // 件數/金額 Map（只對 DEPT_ORDER 統計欄位），避免「未分類」污染部門欄
+  const deptContractCountMap: Map<string, number> = new Map<string, number>();
+  const deptContractAmountMap: Map<string, number> = new Map<string, number>();
+
+  for (const r of filteredRows) {
+    const deptKey: string = resolveDeptKey(r.requesterUnit);
+    if (DEPT_ORDER.indexOf(deptKey) < 0) continue;
+    deptContractCountMap.set(deptKey, (deptContractCountMap.get(deptKey) ?? 0) + 1);
+    deptContractAmountMap.set(deptKey, (deptContractAmountMap.get(deptKey) ?? 0) + r.contractAmount);
+  }
+
+  const deptCounts: number[] = DEPT_ORDER.map(dep => deptContractCountMap.get(dep) ?? 0);
+
+  // ✅ v2：總計/總金額以 filteredRows 全集計算（含未分類）
+  const totalCount: number = filteredRows.length;
+  const totalAmount: number = filteredRows.reduce((a, r) => a + r.contractAmount, 0);
+  const totalAmountM: number = roundTo2(totalAmount / 1_000_000);
+
+  return { deptCounts, totalCount, totalAmountM };
+}
+
+function computeUniqueVendorCountsForCarbonKpi(rows: ContractRow[]): { deptCounts: number[]; totalUnique: number } {
+  // ✅ Map 預先包含「未分類」，避免 undefined
+  const deptVendorSetMap: Map<string, Set<string>> = new Map<string, Set<string>>();
+  for (const dep of [...DEPT_ORDER, "未分類"]) deptVendorSetMap.set(dep, new Set<string>());
+
+  const globalVendorSet: Set<string> = new Set<string>();
+
+  for (const r of rows) {
+    if (r.kpiKey !== KPI_BASE_KEY) continue;
+    const deptKey: string = resolveDeptKey(r.requesterUnit);
+    const vendorKey: string = normalizeVendorKey(r.vendorNameRaw);
+    if (!vendorKey) continue;
+    deptVendorSetMap.get(deptKey)!.add(vendorKey);
+    globalVendorSet.add(vendorKey);
+  }
+
+  return {
+    deptCounts: DEPT_ORDER.map(dep => deptVendorSetMap.get(dep)!.size),
+    totalUnique: globalVendorSet.size
+  };
+}
+
+/* =========================
+ 10) 備註文字（維持原口徑）
+========================= */
+function buildMatrixNoteText(): string {
+  const lines: string[] = [];
+  lines.push("備註（統計口徑與處理方式）：");
+  lines.push("• 資料來源：sheet1；以「請購人單位」關鍵字映射至處級部門，無法映射者列為「未分類」。");
+  lines.push("• 金額單位：百萬元，小數點兩位（四捨五入）。");
+  lines.push("• 3000萬列管：契約金額 ≥ 30,000,000（不排除不適合）。");
+  lines.push("• 契約狀態統計：七類狀態互斥；除不適合兩列本身外，其餘列統計皆排除不適合兩列，以利『狀態合計』可對齊母數。");
+  lines.push("• 資分碳智雲上載契約案：以 KPI=盤查範圍契約 計算（KPI 先做去零寬/全形/trim 正規化後比對）。");
+  lines.push("• 盤查範圍契約(持續盤查契約)：全集 − 通過審核 − 不適合兩列 − 自主盤查。");
+  lines.push("• 不重複供應商數：KPI=盤查範圍契約；供應商名稱清理後 unique；部門欄位=部門 unique；契約總計=全域 unique（非部門加總）。");
+  lines.push("• 稽核異常清單：列出「等待供應商上傳第一筆資料」、「未分類」及「不適合」案件，並加註稽核註記。");
+  lines.push("• 統計日期：採執行時間（利於受眾認同）。");
+  return lines.join("\n");
+}
+
+/* =========================
+ 11) 報表輸出：稽核異常清單（v2：新增稽核註記）
+========================= */
+function renderExceptionListReport(workbook: ExcelScript.Workbook, rows: ContractRow[]): void {
+  const sheet: ExcelScript.Worksheet = getOrCreateWorksheet(workbook, "稽核異常清單");
+  clearWorksheet(sheet);
+
+  // ✅ v2：新增「稽核註記」
+  setHeaderRow(sheet, 1, ["契約編號", "契約名稱", "契約金額", "[統編]供應商名稱", "請購人單位", "請購人", "契約狀態", "稽核註記"]);
+
+  const data: (string | number)[][] = [];
+  for (const r of rows) {
+    const deptKey: string = resolveDeptKey(r.requesterUnit);
+    const statusKey: string = resolveStatusKey(r.contractStatusRaw);
+
+    const notes: string[] = [];
+    const isWaitingFirstUpload: boolean = statusKey === "等待供應商上傳第一筆資料";
+    const isUnclassifiedDept: boolean = deptKey === "未分類";
+    const isUnsuitable: boolean =
+      (statusKey === "請/採購人員認為不適合進行(數位內容採購)") ||
+      (statusKey === "請/採購人員認為不適合進行");
+
+    if (isWaitingFirstUpload) notes.push("等待第一筆");
+    if (isUnclassifiedDept) notes.push("未分類");
+    if (isUnsuitable) notes.push("不適合");
+
+    if (notes.length > 0) {
+      data.push([
+        r.contractId,
+        r.contractName,
+        r.contractAmount,
+        normalizeVendorKey(r.vendorNameRaw),
+        r.requesterUnit,
+        r.requesterName,
+        r.contractStatusRaw,
+        notes.join("；")
+      ]);
+    }
+  }
+
+  writeMatrix(sheet, 2, 1, data);
+  autoFitUsedRange(sheet);
+  if (MIN_COL_WIDTH > 0) enforceMinColumnWidth(sheet, MIN_COL_WIDTH);
+}
+/* =========================
+ 12) 報表輸出：統計分析_矩陣（含檢核 + 備註）
+========================= */
+function renderMatrixReport(workbook: ExcelScript.Workbook, rows: ContractRow[]): void {
+  const sheet: ExcelScript.Worksheet = getOrCreateWorksheet(workbook, "統計分析_矩陣");
+  clearWorksheet(sheet);
+
+  setHeaderRow(sheet, 1, ["管控項目", ...DEPT_ORDER, "契約總計", "金額總計(百萬元)"]);
+
+  const unsuitableStatusSet: Set<string> = new Set<string>([
+    "請/採購人員認為不適合進行(數位內容採購)",
+    "請/採購人員認為不適合進行"
+  ]);
+
+  const isAmountOver30M = (r: ContractRow): boolean => r.contractAmount >= 30_000_000;
+  const isSelfInventoryContract = (r: ContractRow): boolean => r.kpiKey === "自主盤查契約";
+  const isCarbonScopeContract = (r: ContractRow): boolean => r.kpiKey === KPI_BASE_KEY;
+  const isAuditApproved = (r: ContractRow): boolean => resolveStatusKey(r.contractStatusRaw) === "資料通過顧問審核標準";
+  const isExcludedContract = (r: ContractRow): boolean => unsuitableStatusSet.has(resolveStatusKey(r.contractStatusRaw));
+
+  const matrixRows: MatrixRow[] = [];
+
+  // ✅ KPI母體（本次修正核心）：狀態7類統計掛 KPI 母體
+  const kpiBaseRows = rows.filter(r => r.kpiKey === KPI_BASE_KEY);
+
+  for (const rowName of MATRIX_ROW_DEFINITIONS) {
+    if (rowName === "不重複供應商數") {
+      const uniq = computeUniqueVendorCountsForCarbonKpi(rows);
+      matrixRows.push([rowName, ...uniq.deptCounts, uniq.totalUnique, 0]);
+      continue;
+    }
+
+    let agg: DeptAggResult;
+
+    if (rowName === "已簽3000萬元(含)以上列管契約案") {
+      agg = aggregateByDept(rows, isAmountOver30M, false);
+    } else if (CONTRACT_STATUS_7.indexOf(rowName) >= 0) {
+      const excludeUnsuitable: boolean = !(rowName.indexOf("不適合進行") >= 0);
+      agg = aggregateByDept(
+        kpiBaseRows,
+        (x) => resolveStatusKey(x.contractStatusRaw) === rowName,
+        excludeUnsuitable
+      );
+    } else if (rowName === "自主盤查契約") {
+      agg = aggregateByDept(rows, isSelfInventoryContract, true);
+    } else if (rowName === "盤查範圍契約(持續盤查契約)") {
+      agg = aggregateByDept(rows, (x) => !(isAuditApproved(x) || isExcludedContract(x) || isSelfInventoryContract(x)), false);
+    } else if (rowName === "資分碳智雲上載契約案") {
+      agg = aggregateByDept(rows, isCarbonScopeContract, true);
+    } else if (rowName === "未簽署淨零承諾契約案") {
+      agg = aggregateByDept(rows, (x) => normalizeCompactText(x.netZeroCommitmentRaw).indexOf("未簽") >= 0, true);
+    } else {
+      agg = { deptCounts: new Array<number>(DEPT_ORDER.length).fill(0), totalCount: 0, totalAmountM: 0 };
+    }
+
+    matrixRows.push([rowName, ...agg.deptCounts, agg.totalCount, agg.totalAmountM]);
+  }
+
+  writeMatrix(sheet, 2, 1, matrixRows as (string | number)[][]);
+
+  /* ===== 檢核（依契約狀態合計）===== */
+  const checkTitleRow1Based: number = 2 + matrixRows.length + 2;
+  sheet.getCell(checkTitleRow1Based - 1, 0).setValue("檢核（依契約狀態合計）");
+  sheet.getCell(checkTitleRow1Based - 1, 0).getFormat().getFont().setBold(true);
+
+  // ✅ FIX STARTS HERE: Final logic for checks (v2.7.0)
+  const statusOnlyRows: MatrixRow[] = matrixRows.filter((r) => CONTRACT_STATUS_7.indexOf(String(r[0])) >= 0);
+  const statusSumByDept: number[] = new Array<number>(DEPT_ORDER.length).fill(0);
+  for (const r of statusOnlyRows) {
+    for (let i = 0; i < DEPT_ORDER.length; i++) {
+      statusSumByDept[i] += Number(r[1 + i]);
+    }
+  }
+  const totalSumByDept = statusSumByDept.reduce((a, b) => a + b, 0);
+
+  const unclassifiedRows = kpiBaseRows.filter(r =>
+    CONTRACT_STATUS_7.includes(resolveStatusKey(r.contractStatusRaw)) &&
+    resolveDeptKey(r.requesterUnit) === '未分類'
+  );
+  const unclassifiedStatusCount = unclassifiedRows.length;
+  const totalCheckSum = totalSumByDept + unclassifiedStatusCount;
+
+  const countCheckRows: MatrixRow[] = [
+    ["【檢核】狀態合計（部門件數）", ...statusSumByDept, totalCheckSum, ""],
+    ["【檢核】未落入部門統計（未分類-異常清單）", ...new Array(DEPT_ORDER.length).fill(""), unclassifiedStatusCount, ""]
+  ];
+  writeMatrix(sheet, checkTitleRow1Based + 1, 1, countCheckRows);
+
+  /* ===== 檢核（部門金額合計，百萬元）===== */
+  // ✅ FIX: Reduce spacing between check sections to 1 row
+  const amountCheckTitleRow1Based: number = checkTitleRow1Based + 1 + countCheckRows.length + 1;
+  sheet.getCell(amountCheckTitleRow1Based - 1, 0).setValue("檢核（部門金額合計，百萬元）");
+  sheet.getCell(amountCheckTitleRow1Based - 1, 0).getFormat().getFont().setBold(true);
+
+  const deptContractAmountMap: Map<string, number> = new Map<string, number>();
+  for (const dep of DEPT_ORDER) deptContractAmountMap.set(dep, 0);
+
+  for (const r of rows) {
+    const deptKey: string = resolveDeptKey(r.requesterUnit);
+    if (deptContractAmountMap.has(deptKey)) {
+      deptContractAmountMap.set(deptKey, (deptContractAmountMap.get(deptKey) ?? 0) + r.contractAmount);
+    }
+  }
+
+  const deptAmountM: number[] = DEPT_ORDER.map(dep => roundTo2((deptContractAmountMap.get(dep) ?? 0) / 1_000_000));
+  const totalDeptAmountM: number = roundTo2(deptAmountM.reduce((a, b) => a + b, 0));
+
+  // ✅ FIX: Add new row for unclassified amount
+  const unclassifiedAmountM = roundTo2(unclassifiedRows.reduce((sum, r) => sum + r.contractAmount, 0) / 1_000_000);
+
+  const amountCheckRows: MatrixRow[] = [
+    ["【檢核】各部門金額合計", ...deptAmountM, totalDeptAmountM, ""],
+    ["【檢核】未落入部門統計金額（未分類-異常清單）", ...new Array(DEPT_ORDER.length).fill(""), unclassifiedAmountM, ""]
+  ];
+  writeMatrix(sheet, amountCheckTitleRow1Based + 1, 1, amountCheckRows);
+  // ✅ FIX ENDS HERE
+
+  /* ===== 備註列 ===== */
+  if (SHOW_MATRIX_NOTE_ROW) {
+    const noteText: string = buildMatrixNoteText();
+    const usedNow: ExcelScript.Range | undefined = sheet.getUsedRange();
+    const colCount: number = usedNow ? usedNow.getColumnCount() : (1 + DEPT_ORDER.length + 2);
+    const noteRow1Based: number = amountCheckTitleRow1Based + 1 + amountCheckRows.length + 1;
+
+    const rowRange: ExcelScript.Range = sheet.getRangeByIndexes(noteRow1Based - 1, 0, 1, colCount);
+    rowRange.clear(ExcelScript.ClearApplyTo.contents);
+
+    const firstCell: ExcelScript.Range = sheet.getRangeByIndexes(noteRow1Based - 1, 0, 1, 1);
+    firstCell.setValue(noteText);
+
+    const fmt: ExcelScript.RangeFormat = rowRange.getFormat();
+    fmt.setWrapText(MATRIX_NOTE_WRAP);
+    fmt.setHorizontalAlignment(ExcelScript.HorizontalAlignment.left);
+    fmt.getFont().setColor("#666666");
+  }
+
+  autoFitUsedRange(sheet);
+  if (MIN_COL_WIDTH > 0) enforceMinColumnWidth(sheet, MIN_COL_WIDTH);
+}
+
+/* =========================
+ 13) 碳盤查績效統計：計算與輸出（A3 口徑已顯式化）
+========================= */
+type PerformanceResult = {
+  kpiA1_pct: number; kpiA2_pct: number; kpiA3_pct: number; kpiB_ratio: number; kpiC_ratio: number;
+  scoreA1: number; scoreA2: number; scoreA3: number; scoreB: number; scoreC: number;
+  totalCalcScore: number; totalRawScore: number;
+};
+
+function computePerformance(rows: ContractRow[]): PerformanceResult {
+  const signedOver30M: ContractRow[] = rows.filter(r => r.contractAmount >= 30_000_000);
+  const signedCount: number = signedOver30M.length;
+  const signedAmountM: number = roundTo2(signedOver30M.reduce((a, r) => a + r.contractAmount, 0) / 1_000_000);
+
+  const approved: ContractRow[] = signedOver30M.filter(r => resolveStatusKey(r.contractStatusRaw) === "資料通過顧問審核標準");
+  const approvedCount: number = approved.length;
+  const approvedAmountM: number = roundTo2(approved.reduce((a, r) => a + r.contractAmount, 0) / 1_000_000);
+
+  const unsuitableDigitalCount: number = signedOver30M.filter(r => resolveStatusKey(r.contractStatusRaw) === "請/採購人員認為不適合進行(數位內容採購)").length;
+
+  const unsuitableSet: Set<string> = new Set<string>([
+    "請/採購人員認為不適合進行(數位內容採購)",
+    "請/採購人員認為不適合進行"
+  ]);
+
+  const eligibleA3Count: number = signedOver30M.filter(r => !unsuitableSet.has(resolveStatusKey(r.contractStatusRaw))).length;
+
+  const carbonUploadCount_old: number = signedOver30M.filter(r =>
+    r.kpiKey === KPI_BASE_KEY && !unsuitableSet.has(resolveStatusKey(r.contractStatusRaw))
+  ).length;
+
+  const carbonUploadCount: number = A3_ASSUME_IN_REPORT_IS_COMPLIANT ? eligibleA3Count : carbonUploadCount_old;
+
+  const globalVendorSet: Set<string> = new Set<string>();
+  for (const r of rows) {
+    if (r.kpiKey !== KPI_BASE_KEY) continue;
+    const k: string = normalizeVendorKey(r.vendorNameRaw);
+    if (k) globalVendorSet.add(k);
+  }
+  const uniqueVendorTotal: number = globalVendorSet.size;
+
+  // FIX: KPI-B 分子/分母需同量綱（皆以「不重複供應商」為單位）
+  // 舊版用「未簽契約列數」去扣「不重複供應商總數」，在供應商一對多契約時會失真。
+  const netZeroNotSignedVendorSet: Set<string> = new Set<string>();
+  for (const r of rows) {
+    if (r.kpiKey !== KPI_BASE_KEY) continue;
+    if (normalizeCompactText(r.netZeroCommitmentRaw).indexOf("未簽") < 0) continue;
+    const vendorKey: string = normalizeVendorKey(r.vendorNameRaw);
+    if (vendorKey) netZeroNotSignedVendorSet.add(vendorKey);
+  }
+  const netZeroNotSignedVendorCount: number = netZeroNotSignedVendorSet.size;
+
+  const a1_raw: number = safeDivide(approvedCount, signedCount * 0.83);
+  const a1: number = Math.max(0, Math.min(a1_raw, 1));
+
+  const a2_raw: number = safeDivide(approvedAmountM, signedAmountM * 0.83);
+  const a2: number = Math.max(0, Math.min(a2_raw, 1));
+
+  const denomA3: number = (signedCount - unsuitableDigitalCount);
+  const a3_raw: number = safeDivide(carbonUploadCount, denomA3);
+  const a3: number = Math.max(0, Math.min(a3_raw, 1));
+
+  const b_raw: number = safeDivide((uniqueVendorTotal - netZeroNotSignedVendorCount), uniqueVendorTotal);
+  const b: number = Math.max(0, Math.min(b_raw, 1));
+
+  const HQ_DESIGNATED_SUPPLIER_COUNT: number = 1;
+
+  const isoCertifiedVendorSet: Set<string> = new Set<string>();
+  for (const r of rows) {
+    if (r.kpiKey !== KPI_BASE_KEY) continue;
+    const vendorKey: string = normalizeVendorKey(r.vendorNameRaw);
+    if (!vendorKey) continue;
+    const flag: string = normalizeCompactText(r.iso14064EvidenceRaw);
+    if (flag && flag.indexOf("無資料") < 0 && flag.indexOf("未") < 0 && flag.indexOf("否") < 0) {
+      isoCertifiedVendorSet.add(vendorKey);
+    }
+  }
+
+  const isoCertifiedVendorCount: number = isoCertifiedVendorSet.size;
+  const c_raw: number = safeDivide(Math.min(isoCertifiedVendorCount, HQ_DESIGNATED_SUPPLIER_COUNT), HQ_DESIGNATED_SUPPLIER_COUNT);
+  const c: number = Math.max(0, Math.min(c_raw, 1));
+
+  const kpiA1_pct: number = roundTo2(a1 * 100);
+  const kpiA2_pct: number = roundTo2(a2 * 100);
+  const kpiA3_pct: number = roundTo2(a3 * 100);
+
+  const kpiB_ratio: number = roundTo2(b);
+  const kpiC_ratio: number = roundTo2(c);
+
+  const scoreA1: number = roundTo2(a1 * 50);
+  const scoreA2: number = roundTo2(a2 * 40);
+  const scoreA3: number = roundTo2(a3 * 10);
+
+  const scoreB: number = roundTo2(b * 5);
+  const scoreC: number = roundTo2(c * 5);
+
+  const sumA: number = scoreA1 + scoreA2 + scoreA3;
+  const totalRawScore: number = sumA + scoreB + scoreC;
+  const totalCalcScore: number = Math.max(10 * Math.sqrt(sumA) + scoreB + scoreC, 70);
+
+  return {
+    kpiA1_pct, kpiA2_pct, kpiA3_pct, kpiB_ratio, kpiC_ratio,
+    scoreA1, scoreA2, scoreA3, scoreB, scoreC,
+    totalCalcScore: roundTo2(totalCalcScore),
+    totalRawScore: roundTo2(totalRawScore)
+  };
+}
+
+function autofitPerformanceTableRange(ws: ExcelScript.Worksheet, rowCount: number): void {
+  const rng: ExcelScript.Range = ws.getRangeByIndexes(0, 0, rowCount, 3);
+  rng.getFormat().autofitColumns();
+
+  if (MIN_COL_WIDTH > 0) {
+    for (let c = 0; c < 3; c++) {
+      const fmt: ExcelScript.RangeFormat = ws.getRangeByIndexes(0, c, 1, 1).getEntireColumn().getFormat();
+      const w: number = fmt.getColumnWidth();
+      if (w < MIN_COL_WIDTH) fmt.setColumnWidth(MIN_COL_WIDTH);
+    }
+  }
+
+  const colA: ExcelScript.RangeFormat = ws.getRange("A:A").getFormat();
+  const colB: ExcelScript.RangeFormat = ws.getRange("B:B").getFormat();
+  const colC: ExcelScript.RangeFormat = ws.getRange("C:C").getFormat();
+  if (colA.getColumnWidth() < PERF_COL_WIDTH_A) colA.setColumnWidth(PERF_COL_WIDTH_A);
+  if (colB.getColumnWidth() < PERF_COL_WIDTH_B) colB.setColumnWidth(PERF_COL_WIDTH_B);
+  if (colC.getColumnWidth() < PERF_COL_WIDTH_C) colC.setColumnWidth(PERF_COL_WIDTH_C);
+}
+
+function renderPerformanceSheet(ws: ExcelScript.Worksheet, perf: PerformanceResult, orgLabel: string, headerFillColor: string): void {
+  clearWorksheet(ws);
+
+  const out: (string | number)[][] = [
+    ["1.3範疇三供應鏈碳管理：", "KPI計算", `${orgLabel}實績現況`],
+    ["1.1 盤查件數達成率", perf.kpiA1_pct, perf.scoreA1],
+    ["1.2 盤查契約金額達成率", perf.kpiA2_pct, perf.scoreA2],
+    ["1.3 碳足跡條款落實達成率", perf.kpiA3_pct, perf.scoreA3],
+    ["2 供應商淨零承諾達成率", perf.kpiB_ratio, perf.scoreB],
+    ["3 ISO 14064-1輔導證書達成率", perf.kpiC_ratio, perf.scoreC],
+    [`${orgLabel}累計得分試算`, perf.totalCalcScore, perf.totalRawScore]
+  ];
+
+  writeMatrix(ws, 1, 1, out);
+
+  const header: ExcelScript.Range = ws.getRangeByIndexes(0, 0, 1, 3);
+  const hfmt: ExcelScript.RangeFormat = header.getFormat();
+  hfmt.getFill().setColor(headerFillColor);
+  hfmt.getFont().setBold(true);
+  hfmt.getFont().setColor(HEADER_TEXT_COLOR);
+  hfmt.setHorizontalAlignment(ExcelScript.HorizontalAlignment.center);
+
+  ws.getRange("A:A").getFormat().setWrapText(PERFORMANCE_LABEL_WRAP);
+  ws.getRange("A1:C1").getFormat().setWrapText(PERFORMANCE_LABEL_WRAP);
+
+  autofitPerformanceTableRange(ws, out.length);
+}
+
+function renderPerformanceReports(workbook: ExcelScript.Workbook, rows: ContractRow[]): void {
+  const mainSheet: ExcelScript.Worksheet = getOrCreateWorksheet(workbook, "碳盤查績效統計");
+  renderPerformanceSheet(mainSheet, computePerformance(rows), "資分", "#D9E1F2");
+
+  const deps: string[] = [...DEPT_ORDER, "未分類"];
+  for (const dep of deps) {
+    const deptRows: ContractRow[] = rows.filter(r => resolveDeptKey(r.requesterUnit) === dep);
+    const wsName: string = `${PERFORMANCE_SHEET_PREFIX}${dep}`;
+    const ws: ExcelScript.Worksheet = getOrCreateWorksheet(workbook, wsName);
+    renderPerformanceSheet(ws, computePerformance(deptRows), dep, "#E2F0D9");
+  }
+}
+
+/* =========================
+ 14) 外框樣式（TableStyle）— 主表 + 分表
+========================= */
+function applyTableStyleOutline(workbook: ExcelScript.Workbook): void {
+  const allSheets: ExcelScript.Worksheet[] = workbook.getWorksheets();
+
+  for (const ws of allSheets) {
+    const sheetName: string = ws.getName();
+    const isTarget: boolean =
+      (REPORT_MAIN_SHEET_NAMES.indexOf(sheetName) >= 0) ||
+      (sheetName.indexOf(PERFORMANCE_SHEET_PREFIX) === 0);
+
+    if (!isTarget) continue;
+
+    const used: ExcelScript.Range | undefined = ws.getUsedRange();
+    if (!used) continue;
+
+    const tables: ExcelScript.Table[] = ws.getTables();
+
+    if (tables && tables.length > 0) {
+      for (const t of tables) {
+        try {
+          t.setPredefinedTableStyle(REPORT_TABLE_STYLE_NAME);
+          t.setShowBandedRows(false);
+          t.setShowBandedColumns(false);
+          t.setShowFilterButton(TABLE_SHOW_FILTER_BUTTON);
+          t.setShowTotals(false);
+        } catch { }
+      }
+    } else {
+      const addrLocal: string = normalizeRangeAddress(used.getAddress());
+      let tbl: ExcelScript.Table;
+      try { tbl = ws.addTable(addrLocal, TABLE_HAS_HEADER_ROW); }
+      catch { tbl = ws.addTable(addrLocal, false); }
+
+      try {
+        tbl.setPredefinedTableStyle(REPORT_TABLE_STYLE_NAME);
+        tbl.setShowBandedRows(false);
+        tbl.setShowBandedColumns(false);
+        tbl.setShowFilterButton(TABLE_SHOW_FILTER_BUTTON);
+        tbl.setShowTotals(false);
+      } catch { }
+    }
+
+    if (ENABLE_AUTOFIT_COLUMNS) {
+      autoFitUsedRange(ws);
+      if (MIN_COL_WIDTH > 0) enforceMinColumnWidth(ws, MIN_COL_WIDTH);
+    }
+  }
+}
+
+/* =========================
+ 15) 執行時間（台北時間治理）— 不依賴環境時區
+========================= */
+function pad2(n: number): string { return (n < 10 ? "0" : "") + n; }
+
+function formatTaipeiExecutionTime(): string {
+  const nowUtcEpochMs: number = new Date().getTime();
+  const taipeiEpochMs: number = nowUtcEpochMs + (TAIPEI_UTC_OFFSET_HOURS * 60 * 60 * 1000);
+  const taipei: Date = new Date(taipeiEpochMs);
+  const y: number = taipei.getUTCFullYear();
+  const m: string = pad2(taipei.getUTCMonth() + 1);
+  const d: string = pad2(taipei.getUTCDate());
+  const hh: string = pad2(taipei.getUTCHours());
+  const mm: string = pad2(taipei.getUTCMinutes());
+  return `${y}/${m}/${d} ${hh}:${mm}`;
+}
+
+function appendExecutionTimeRow(ws: ExcelScript.Worksheet): void {
+  const used: ExcelScript.Range | undefined = ws.getUsedRange();
+  if (!used) return;
+
+  const values: TwoD = used.getValues();
+  const startRow: number = used.getRowIndex();
+  const startCol: number = used.getColumnIndex();
+  const colCount: number = used.getColumnCount();
+  if (colCount <= 0) return;
+
+  let lastNonEmptyOffset: number = -1;
+  for (let rr = values.length - 1; rr >= 0; rr--) {
+    const row = values[rr];
+    let hasValue = false;
+    for (let cc = 0; cc < row.length; cc++) {
+      const v = row[cc];
+      if (v !== null && v !== "" && v !== false) { hasValue = true; break; }
+    }
+    if (hasValue) { lastNonEmptyOffset = rr; break; }
+  }
+
+  const targetRowIndex: number =
+    (lastNonEmptyOffset >= 0) ? (startRow + lastNonEmptyOffset + 1) : (startRow + values.length);
+
+  const rowRange: ExcelScript.Range = ws.getRangeByIndexes(targetRowIndex, startCol, 1, colCount);
+  rowRange.clear(ExcelScript.ClearApplyTo.contents);
+
+  const rowValues: (string | number | boolean | null)[] = new Array(colCount).fill("");
+  rowValues[0] = `統計日期（執行時間）：${formatTaipeiExecutionTime()}`;
+
+  rowRange.setValues([rowValues] as TwoD);
+
+  const fmt: ExcelScript.RangeFormat = rowRange.getFormat();
+  fmt.setHorizontalAlignment(ExcelScript.HorizontalAlignment.left);
+  fmt.setWrapText(EXECUTION_TIME_WRAP);
+
+  const font: ExcelScript.RangeFont = fmt.getFont();
+  font.setItalic(true);
+  font.setColor("#666666");
+}
+
+/* =========================
+ 16) main（唯一入口）
+========================= */
+function main(workbook: ExcelScript.Workbook): void {
+  const sourceRows: ContractRow[] = readSourceRows(workbook);
+
+  renderMatrixReport(workbook, sourceRows);
+  renderExceptionListReport(workbook, sourceRows);
+  renderPerformanceReports(workbook, sourceRows);
+
+  if (ENABLE_TABLE_STYLE_OUTLINE) {
+    applyTableStyleOutline(workbook);
+  }
+
+  // 主表 + 分表一律補台北時間（制度一致）
+  const allSheets: ExcelScript.Worksheet[] = workbook.getWorksheets();
+  for (const ws of allSheets) {
+    const name: string = ws.getName();
+    const isTarget: boolean =
+      (REPORT_MAIN_SHEET_NAMES.indexOf(name) >= 0) ||
+      (name.indexOf(PERFORMANCE_SHEET_PREFIX) === 0);
+
+    if (isTarget) appendExecutionTimeRow(ws);
+  }
+}

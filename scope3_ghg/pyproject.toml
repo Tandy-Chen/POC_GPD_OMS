@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scope3-ghg"
+version = "0.2.0"
+description = "Scope 3 GHG reporting pipeline"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "openpyxl>=3.1.0",
+]
+
+[project.scripts]
+scope3-ghg = "scope3_ghg.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
